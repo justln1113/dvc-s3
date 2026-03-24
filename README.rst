@@ -11,8 +11,7 @@ significantly faster ``dvc push`` / ``dvc pull``.
 Installation
 ------------
 
-Install from this repository (replaces the official ``dvc-s3`` if already
-installed):
+**Step 1 — Install this fork** (replaces the official ``dvc-s3``):
 
 .. code-block:: bash
 
@@ -26,17 +25,38 @@ automatically replace it. To verify:
    pip show dvc-s3          # Source should point to this repo
    dvc version              # Should list dvc-s3 under Subprojects
 
-To revert to the official version at any time:
+**Step 2 — Patch DVC config schema** so that ``dvc remote modify`` accepts the
+new transfer tuning parameters:
 
 .. code-block:: bash
 
-   pip install dvc-s3       # Reinstalls from PyPI
+   # Download and run the patch script (one-time, re-run after upgrading DVC)
+   curl -O https://raw.githubusercontent.com/justln1113/dvc-s3/main/patch_dvc_schema.py
+   python patch_dvc_schema.py
+
+   # Verify
+   python patch_dvc_schema.py --check
+
+.. note::
+
+   This patches DVC's built-in config validator to recognise
+   ``max_concurrent_requests``, ``multipart_threshold``,
+   ``multipart_chunksize``, and ``max_queue_size``.
+   You need to **re-run the script after upgrading DVC** (``pip install -U dvc``).
+   To undo: ``python patch_dvc_schema.py --revert``.
+
+To revert everything to official versions at any time:
+
+.. code-block:: bash
+
+   python patch_dvc_schema.py --revert   # Undo the schema patch
+   pip install dvc-s3                     # Reinstall official dvc-s3 from PyPI
 
 Quick Start
 -----------
 
-After installation, apply the recommended settings for your remote and
-you are ready to go:
+After installation and patching, apply the recommended settings for your
+remote and you are ready to go:
 
 .. code-block:: bash
 
