@@ -261,10 +261,9 @@ class S3FileSystem(ObjectFileSystem):
         import botocore.session
         from botocore.config import Config as BotoConfig
 
-        session = botocore.session.get_session()
-
-        if getattr(s3_fs, "profile", None):
-            session.set_config_variable("profile", s3_fs.profile)
+        session = botocore.session.Session(
+            profile=getattr(s3_fs, "profile", None),
+        )
 
         tc = self._transfer_config or {}
         pool_size = max(tc.get("max_concurrency", 20) * 2, 50)
