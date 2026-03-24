@@ -340,7 +340,7 @@ class S3FileSystem(ObjectFileSystem):
             loop = asyncio.get_running_loop()
 
             def _upload():
-                bucket, key = s3_fs.split_path(rpath)
+                bucket, key, *_ = s3_fs.split_path(rpath)
                 cb = callback.relative_update if callback else None
                 transfer.upload_file(
                     lpath,
@@ -356,7 +356,7 @@ class S3FileSystem(ObjectFileSystem):
             loop = asyncio.get_running_loop()
 
             def _download():
-                bucket, key = s3_fs.split_path(rpath)
+                bucket, key, *_ = s3_fs.split_path(rpath)
                 cb = callback.relative_update if callback else None
                 transfer.download_file(
                     bucket,
