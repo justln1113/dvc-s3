@@ -256,14 +256,18 @@ class S3FileSystem(ObjectFileSystem):
         max_conc = transfer_config.get("max_concurrency", 0)
         config_kwargs["max_pool_connections"] = max(max_conc, 20)
 
-    def _create_botocore_client(self, s3_fs):
-        """Create a sync botocore S3 client for s3transfer."""
+    def _create_botocore_client(self):
+        """Create a sync botocore S3 client for s3transfer.
+
+        Reads credentials from self._config (the original DVC remote config)
+        rather than s3fs instance attributes, because s3fs stores profile and
+        other auth params in internal kwargs that are not reliably accessible.
+        """
         import botocore.session
         from botocore.config import Config as BotoConfig
 
-        session = botocore.session.Session(
-            profile=getattr(s3_fs, "profile", None),
-        )
+        config = self._config
+        session = botocore.session.Session(profile=config.get("profile"))
 
         tc = self._transfer_config or {}
         pool_size = max(tc.get("max_concurrency", 20) * 2, 50)
@@ -271,28 +275,38 @@ class S3FileSystem(ObjectFileSystem):
         config_dict = {"max_pool_connections": pool_size}
 
         for key in ("read_timeout", "connect_timeout"):
-            val = (s3_fs.config_kwargs or {}).get(key)
+            val = config.get(key)
             if val is not None:
-                config_dict[key] = val
+                config_dict[key] = int(val)
 
-        if getattr(s3_fs, "anon", False):
+        if config.get("allow_anonymous_login"):
             from botocore import UNSIGNED
 
             config_dict["signature_version"] = UNSIGNED
 
         client_kwargs = {"config": BotoConfig(**config_dict)}
 
-        for key in ("endpoint_url", "region_name", "verify"):
-            val = (s3_fs.client_kwargs or {}).get(key)
-            if val is not None:
-                client_kwargs[key] = val
+        endpoint_url = config.get("endpointurl")
+        if endpoint_url:
+            client_kwargs["endpoint_url"] = endpoint_url
 
-        if getattr(s3_fs, "key", None):
-            client_kwargs["aws_access_key_id"] = s3_fs.key
-        if getattr(s3_fs, "secret", None):
-            client_kwargs["aws_secret_access_key"] = s3_fs.secret
-        if getattr(s3_fs, "token", None):
-            client_kwargs["aws_session_token"] = s3_fs.token
+        region = config.get("region")
+        if region:
+            client_kwargs["region_name"] = region
+
+        ssl_verify = config.get("ssl_verify")
+        if ssl_verify is not None:
+            client_kwargs["verify"] = ssl_verify
+
+        access_key = config.get("access_key_id")
+        if access_key:
+            client_kwargs["aws_access_key_id"] = access_key
+        secret_key = config.get("secret_access_key")
+        if secret_key:
+            client_kwargs["aws_secret_access_key"] = secret_key
+        token = config.get("session_token")
+        if token:
+            client_kwargs["aws_session_token"] = token
 
         return session.create_client("s3", **client_kwargs)
 
@@ -308,7 +322,7 @@ class S3FileSystem(ObjectFileSystem):
 
         from s3transfer import S3Transfer, TransferConfig
 
-        client = self._create_botocore_client(s3_fs)
+        client = self._create_botocore_client()
 
         tc = self._transfer_config or {}
         config = TransferConfig(
