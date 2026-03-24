@@ -41,7 +41,7 @@ def human_readable_to_bytes(value: str) -> int:
 # pylint:disable=abstract-method
 class S3FileSystem(ObjectFileSystem):
     protocol = "s3"
-    REQUIRES: ClassVar[dict[str, str]] = {"s3fs": "s3fs"}
+    REQUIRES: ClassVar[dict[str, str]] = {"s3fs": "s3fs", "s3transfer": "s3transfer"}
     PARAM_CHECKSUM = "etag"
 
     VERSION_ID_KEY = "versionId"
@@ -223,11 +223,153 @@ class S3FileSystem(ObjectFileSystem):
         if config_path:
             os.environ.setdefault("AWS_CONFIG_FILE", config_path)
 
+        self._apply_transfer_config(config, login_info, config_kwargs)
+
         d = flatten(login_info, reducer="dot")
         return unflatten(
             {key: value for key, value in d.items() if value is not None},
             splitter="dot",
         )
+
+    # Keys that s3fs accepts as init params (others go only to s3transfer)
+    _S3FS_TRANSFER_KEYS: ClassVar[set[str]] = {"max_concurrency"}
+
+    def _apply_transfer_config(self, config, login_info, config_kwargs):
+        """Merge AWS config file + DVC config transfer settings and apply."""
+        transfer_config = dict(self._transfer_config or {})
+        for key, s3fs_key in self._TRANSFER_CONFIG_ALIASES.items():
+            if key in config:
+                value = config[key]
+                if key in {"multipart_chunksize", "multipart_threshold"}:
+                    value = human_readable_to_bytes(value)
+                else:
+                    value = int(value)
+                transfer_config[s3fs_key] = value
+
+        self._transfer_config = transfer_config
+
+        # Only pass s3fs-compatible keys; others are used by s3transfer only
+        for key, value in transfer_config.items():
+            if key in self._S3FS_TRANSFER_KEYS:
+                login_info[key] = value
+
+        max_conc = transfer_config.get("max_concurrency", 0)
+        config_kwargs["max_pool_connections"] = max(max_conc, 20)
+
+    def _create_botocore_client(self, s3_fs):
+        """Create a sync botocore S3 client for s3transfer."""
+        import botocore.session
+        from botocore.config import Config as BotoConfig
+
+        session = botocore.session.get_session()
+
+        if getattr(s3_fs, "profile", None):
+            session.set_config_variable("profile", s3_fs.profile)
+
+        tc = self._transfer_config or {}
+        pool_size = max(tc.get("max_concurrency", 20) * 2, 50)
+
+        config_dict = {"max_pool_connections": pool_size}
+
+        for key in ("read_timeout", "connect_timeout"):
+            val = (s3_fs.config_kwargs or {}).get(key)
+            if val is not None:
+                config_dict[key] = val
+
+        if getattr(s3_fs, "anon", False):
+            from botocore import UNSIGNED
+
+            config_dict["signature_version"] = UNSIGNED
+
+        client_kwargs = {"config": BotoConfig(**config_dict)}
+
+        for key in ("endpoint_url", "region_name", "verify"):
+            val = (s3_fs.client_kwargs or {}).get(key)
+            if val is not None:
+                client_kwargs[key] = val
+
+        if getattr(s3_fs, "key", None):
+            client_kwargs["aws_access_key_id"] = s3_fs.key
+        if getattr(s3_fs, "secret", None):
+            client_kwargs["aws_secret_access_key"] = s3_fs.secret
+        if getattr(s3_fs, "token", None):
+            client_kwargs["aws_session_token"] = s3_fs.token
+
+        return session.create_client("s3", **client_kwargs)
+
+    def _patch_transfer_methods(self, s3_fs):
+        """Replace s3fs transfer methods with s3transfer for better performance.
+
+        s3transfer uses parallel byte-range GETs for downloads and optimized
+        multipart uploads, providing significantly faster transfers than s3fs's
+        default sequential implementation.
+        """
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+        from s3transfer import S3Transfer, TransferConfig
+
+        client = self._create_botocore_client(s3_fs)
+
+        tc = self._transfer_config or {}
+        config = TransferConfig(
+            max_concurrency=tc.get("max_concurrency", 20),
+            multipart_threshold=tc.get("multipart_threshold", 8 * 1024 * 1024),
+            multipart_chunksize=tc.get("multipart_chunksize", 8 * 1024 * 1024),
+            num_download_attempts=5,
+        )
+
+        transfer = S3Transfer(client, config)
+
+        upload_extra = {
+            k: v
+            for k, v in (s3_fs.s3_additional_kwargs or {}).items()
+            if v is not None and k in S3Transfer.ALLOWED_UPLOAD_ARGS
+        }
+        download_extra = {
+            k: v
+            for k, v in (s3_fs.s3_additional_kwargs or {}).items()
+            if v is not None and k in S3Transfer.ALLOWED_DOWNLOAD_ARGS
+        }
+
+        pool = _ThreadPoolExecutor(
+            max_workers=tc.get("max_concurrency", 20),
+        )
+
+        async def _fast_put_file(lpath, rpath, callback=None, **kwargs):
+            loop = asyncio.get_running_loop()
+
+            def _upload():
+                bucket, key = s3_fs.split_path(rpath)
+                cb = callback.relative_update if callback else None
+                transfer.upload_file(
+                    lpath,
+                    bucket,
+                    key,
+                    callback=cb,
+                    extra_args=upload_extra or None,
+                )
+
+            await loop.run_in_executor(pool, _upload)
+
+        async def _fast_get_file(rpath, lpath, callback=None, **kwargs):
+            loop = asyncio.get_running_loop()
+
+            def _download():
+                bucket, key = s3_fs.split_path(rpath)
+                cb = callback.relative_update if callback else None
+                transfer.download_file(
+                    bucket,
+                    key,
+                    lpath,
+                    callback=cb,
+                    extra_args=download_extra or None,
+                )
+
+            await loop.run_in_executor(pool, _download)
+
+        s3_fs._put_file = _fast_put_file
+        s3_fs._get_file = _fast_get_file
 
     @wrap_prop(threading.Lock())
     @cached_property
@@ -236,6 +378,8 @@ class S3FileSystem(ObjectFileSystem):
 
         s3_filesystem = _S3FileSystem(**self.fs_args)
         s3_filesystem.connect()
+
+        self._patch_transfer_methods(s3_filesystem)
 
         return s3_filesystem
 

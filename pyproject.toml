@@ -35,6 +35,7 @@ dependencies = [
     "fsspec",
     "s3fs>=2024.12.0",
     "botocore",
+    "s3transfer>=0.10.0",
     "flatten_dict>=0.4.1,<1",
 ]
 
